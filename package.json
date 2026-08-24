@@ -1,0 +1,55 @@
+{
+  "name": "chromecast-direct-cast",
+  "version": "0.1.0",
+  "description": "Discover authorized HLS or DASH streams and cast them directly with catt.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mdiloreto/chromecast-direct-cast.git"
+  },
+  "homepage": "https://github.com/mdiloreto/chromecast-direct-cast#readme",
+  "bugs": {
+    "url": "https://github.com/mdiloreto/chromecast-direct-cast/issues"
+  },
+  "keywords": [
+    "catt",
+    "chromecast",
+    "dash",
+    "hls",
+    "m3u8"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "chromecast-direct-cast": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsc -p tsconfig.build.json",
+    "check": "npm run lint && npm run typecheck && npm run test && npm run build",
+    "prepublishOnly": "npm run check"
+  },
+  "dependencies": {
+    "cheerio": "1.0.0",
+    "commander": "14.0.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.2.0",
+    "eslint": "^10.9.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.67.0",
+    "vitest": "^4.1.11"
+  }
+}
