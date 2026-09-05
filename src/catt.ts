@@ -9,9 +9,17 @@ export type PlaybackState =
   | "UNKNOWN";
 
 export interface CattStatus {
+  hasContent?: boolean;
+  receiverApp?: string;
   state: PlaybackState;
   volume?: number;
   muted?: boolean;
+}
+
+export interface ChromecastDevice {
+  host: string;
+  manufacturer: string;
+  name: string;
 }
 
 export interface ProcessResult {
@@ -47,12 +55,25 @@ export class CattError extends Error {
 export class CattClient {
   public constructor(private readonly runner: ProcessRunner = spawnRunner) {}
 
+  public async scan(signal?: AbortSignal): Promise<ChromecastDevice[]> {
+    const result = await this.run("scan", ["scan"], {
+      ...(signal === undefined ? {} : { signal }),
+    });
+    return parseCattScan(result.stdout);
+  }
+
   public async cast(
     manifestUrl: string,
     device: string,
     signal?: AbortSignal,
   ): Promise<void> {
-    await this.run("cast", [...deviceArgs(device), "cast", "-"], {
+    await this.run("cast", [
+      ...deviceArgs(device),
+      "cast",
+      "--stream-type",
+      "live",
+      "-",
+    ], {
       input: manifestUrl,
       timeoutMs: CAST_TIMEOUT_MS,
       ...(signal === undefined ? {} : { signal }),
@@ -63,7 +84,7 @@ export class CattClient {
     device: string,
     signal?: AbortSignal,
   ): Promise<CattStatus> {
-    const result = await this.run("status", [...deviceArgs(device), "status"], {
+    const result = await this.run("status", [...deviceArgs(device), "info"], {
       ...(signal === undefined ? {} : { signal }),
     });
     return parseCattStatus(result.stdout);
@@ -90,7 +111,7 @@ export class CattClient {
   }
 
   private async run(
-    operation: "cast" | "status" | "stop" | "volume",
+    operation: "cast" | "scan" | "status" | "stop" | "volume",
     args: readonly string[],
     options: ProcessOptions = {},
   ): Promise<ProcessResult> {
@@ -113,22 +134,56 @@ export class CattClient {
   }
 }
 
+export function parseCattScan(output: string): ChromecastDevice[] {
+  const devices: ChromecastDevice[] = [];
+
+  for (const line of output.split(/\r?\n/u)) {
+    const match = /^\s*([^\s]+)\s+-\s+(.+?)\s+-\s+(.+?)\s*$/u.exec(line);
+    if (match?.[1] === undefined || match[2] === undefined || match[3] === undefined) {
+      continue;
+    }
+
+    devices.push({
+      host: match[1],
+      manufacturer: match[3],
+      name: match[2],
+    });
+  }
+
+  return devices;
+}
+
 export function parseCattStatus(output: string): CattStatus {
   let state: PlaybackState = "UNKNOWN";
+  let hasContent: boolean | undefined;
+  let receiverApp: string | undefined;
   let volume: number | undefined;
   let muted: boolean | undefined;
 
   for (const line of output.split(/\r?\n/u)) {
     const stateMatch =
-      /^\s*(?:player\s+)?state\s*:\s*([A-Za-z]+)\s*$/iu.exec(line);
+      /^\s*(?:player[\s_]+)?state\s*:\s*([A-Za-z]+)\s*$/iu.exec(line);
     if (stateMatch?.[1] !== undefined) {
       state = parsePlaybackState(stateMatch[1]);
       continue;
     }
 
-    const volumeMatch = /^\s*volume\s*:\s*(\d+(?:\.\d+)?)\s*$/iu.exec(
-      line,
-    );
+    const contentMatch = /^\s*content_id\s*:\s*(.*)\s*$/iu.exec(line);
+    if (contentMatch?.[1] !== undefined) {
+      const contentId = contentMatch[1].trim();
+      hasContent =
+        contentId.length > 0 && !/^(?:none|null)$/iu.test(contentId);
+      continue;
+    }
+
+    const displayNameMatch = /^\s*display_name\s*:\s*(.*)\s*$/iu.exec(line);
+    if (displayNameMatch?.[1] !== undefined) {
+      receiverApp = displayNameMatch[1].trim();
+      continue;
+    }
+
+    const volumeMatch =
+      /^\s*volume(?:[\s_]+level)?\s*:\s*(\d+(?:\.\d+)?)\s*$/iu.exec(line);
     if (volumeMatch?.[1] !== undefined) {
       const parsedVolume = Number(volumeMatch[1]);
       if (Number.isFinite(parsedVolume) && parsedVolume >= 0) {
@@ -138,13 +193,15 @@ export function parseCattStatus(output: string): CattStatus {
     }
 
     const mutedMatch =
-      /^\s*(?:volume\s+)?muted\s*:\s*(true|false)\s*$/iu.exec(line);
+      /^\s*(?:volume[\s_]+)?muted\s*:\s*(true|false)\s*$/iu.exec(line);
     if (mutedMatch?.[1] !== undefined) {
       muted = mutedMatch[1].toLowerCase() === "true";
     }
   }
 
   return {
+    ...(hasContent === undefined ? {} : { hasContent }),
+    ...(receiverApp === undefined ? {} : { receiverApp }),
     state,
     ...(volume === undefined ? {} : { volume }),
     ...(muted === undefined ? {} : { muted }),
