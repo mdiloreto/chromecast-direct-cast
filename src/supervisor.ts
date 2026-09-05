@@ -14,6 +14,7 @@ export interface CattController {
 
 export interface SupervisorConfig {
   pageUrl: string;
+  fallbackPageUrls?: readonly string[];
   device: string;
   volume?: number;
   monitorSeconds: number;
@@ -23,12 +24,14 @@ export interface SupervisorConfig {
 }
 
 export type SupervisorEvent =
-  | { type: "casting" }
+  | { type: "casting"; source: CastSourceName }
   | { type: "complete" }
-  | { type: "discovering" }
+  | { type: "discovering"; source: CastSourceName }
   | { type: "interrupted" }
-  | { type: "recovering"; attempt: number; maximum: number }
+  | { type: "recovering"; attempt: number; maximum?: number }
   | { type: "state"; state: PlaybackState };
+
+export type CastSourceName = "fallback" | "primary";
 
 export type DiscoverManifest = (
   pageUrl: string,
@@ -47,9 +50,16 @@ export interface SupervisorDependencies {
   sleep?: Sleep;
 }
 
-const INITIAL_PLAYBACK_TIMEOUT_SECONDS = 60;
+const INITIAL_PLAYBACK_TIMEOUT_SECONDS = 30;
+const STARTUP_INACTIVE_OBSERVATIONS_BEFORE_SOURCE_FAIL = 2;
+const STARTUP_BUFFERING_OBSERVATIONS_BEFORE_SOURCE_FAIL = 2;
 const INACTIVE_OBSERVATIONS_BEFORE_RECOVERY = 3;
-const BUFFERING_OBSERVATIONS_BEFORE_RECOVERY = 6;
+const BUFFERING_OBSERVATIONS_BEFORE_RECOVERY = 3;
+
+interface CastSource {
+  name: CastSourceName;
+  pageUrl: string;
+}
 
 export class SupervisorError extends Error {
   public constructor(message: string) {
@@ -80,7 +90,7 @@ export async function superviseCast(
   const observeState = async (): Promise<PlaybackState> => {
     try {
       const status = await dependencies.catt.status(config.device, signal);
-      return status.state;
+      return effectivePlaybackState(status);
     } catch {
       return "UNKNOWN";
     }
@@ -101,11 +111,13 @@ export async function superviseCast(
     }
   };
 
-  const waitForPlaying = async (): Promise<boolean> => {
+  const waitForPlaying = async (failFastInactiveStartup: boolean): Promise<boolean> => {
     const maximumObservations = Math.max(
       1,
       Math.ceil(INITIAL_PLAYBACK_TIMEOUT_SECONDS / config.pollSeconds),
     );
+    let startupBufferingObservations = 0;
+    let startupInactiveObservations = 0;
 
     for (let observation = 0; observation < maximumObservations; observation += 1) {
       if (signal.aborted) {
@@ -115,6 +127,28 @@ export async function superviseCast(
       reportState(state);
       if (state === "PLAYING") {
         return true;
+      }
+      if (failFastInactiveStartup && (state === "IDLE" || state === "UNKNOWN")) {
+        startupInactiveObservations += 1;
+        if (
+          startupInactiveObservations >=
+          STARTUP_INACTIVE_OBSERVATIONS_BEFORE_SOURCE_FAIL
+        ) {
+          throw new SupervisorError("Playback did not start.");
+        }
+      } else {
+        startupInactiveObservations = 0;
+      }
+      if (failFastInactiveStartup && state === "BUFFERING") {
+        startupBufferingObservations += 1;
+        if (
+          startupBufferingObservations >=
+          STARTUP_BUFFERING_OBSERVATIONS_BEFORE_SOURCE_FAIL
+        ) {
+          throw new SupervisorError("Playback did not start.");
+        }
+      } else {
+        startupBufferingObservations = 0;
       }
       if (
         observation < maximumObservations - 1 &&
@@ -127,44 +161,109 @@ export async function superviseCast(
     throw new SupervisorError("Playback did not start.");
   };
 
-  const castFreshManifest = async (): Promise<boolean> => {
-    emit({ type: "discovering" });
-    let manifestUrl: string;
+  let recoveries = 0;
+  const recoveriesExhausted = (): boolean =>
+    config.recoverAttempts > 0 && recoveries >= config.recoverAttempts;
+
+  const castFreshManifest = async (
+    source: CastSource,
+    failFastInactiveStartup: boolean,
+  ): Promise<boolean> => {
+    emit({ source: source.name, type: "discovering" });
     try {
-      manifestUrl = await dependencies.discover(config.pageUrl, signal);
-    } catch (error) {
+      const manifestUrl = await dependencies.discover(source.pageUrl, signal);
+      if (isAborted()) {
+        return false;
+      }
+
+      emit({ source: source.name, type: "casting" });
+      await dependencies.catt.cast(manifestUrl, config.device, signal);
+      if (isAborted()) {
+        return false;
+      }
+      if (config.volume !== undefined) {
+        await dependencies.catt.volume(config.volume, config.device, signal);
+      }
+      if (isAborted()) {
+        return false;
+      }
+      return await waitForPlaying(failFastInactiveStartup);
+    } catch {
       if (signal.aborted) {
         return false;
       }
-      throw error;
-    }
-    if (isAborted()) {
       return false;
     }
 
-    emit({ type: "casting" });
-    await dependencies.catt.cast(manifestUrl, config.device, signal);
-    if (isAborted()) {
-      return false;
-    }
-    if (config.volume !== undefined) {
-      await dependencies.catt.volume(config.volume, config.device, signal);
-    }
-    if (isAborted()) {
-      return false;
-    }
-    return waitForPlaying();
   };
 
-  if (!(await castFreshManifest())) {
+  const castFreshManifestFromAnySource = async (): Promise<boolean> => {
+    const sources: CastSource[] = [
+      { name: "primary", pageUrl: config.pageUrl },
+      ...(config.fallbackPageUrls ?? []).map((pageUrl) => ({
+        name: "fallback" as const,
+        pageUrl,
+      })),
+    ];
+
+    for (const source of sources) {
+      if (await castFreshManifest(source, sources.length > 1)) {
+        return true;
+      }
+      if (signal.aborted) {
+        return false;
+      }
+    }
+
+    throw new SupervisorError("Playback did not start.");
+  };
+
+  const castWithRecovery = async (recovery: boolean): Promise<boolean> => {
+    let isRecoveryAttempt = recovery;
+
+    while (!signal.aborted) {
+      if (isRecoveryAttempt) {
+        if (recoveriesExhausted()) {
+          throw new SupervisorError("Playback became inactive.");
+        }
+        recoveries += 1;
+        emit({
+          attempt: recoveries,
+          ...(config.recoverAttempts === 0
+            ? {}
+            : { maximum: config.recoverAttempts }),
+          type: "recovering",
+        });
+      }
+
+      try {
+        return await castFreshManifestFromAnySource();
+      } catch {
+        if (isAborted()) {
+          return false;
+        }
+      }
+
+      isRecoveryAttempt = true;
+      if (!(await pause(pollMilliseconds))) {
+        return false;
+      }
+    }
+
+    return false;
+  };
+
+  if (!(await castWithRecovery(false))) {
     emit({ type: "interrupted" });
     return;
   }
 
-  const deadline = now() + config.monitorSeconds * 1_000;
+  const deadline =
+    config.monitorSeconds === 0
+      ? Number.POSITIVE_INFINITY
+      : now() + config.monitorSeconds * 1_000;
   let bufferingObservations = 0;
   let inactiveObservations = 0;
-  let recoveries = 0;
 
   while (now() < deadline && !signal.aborted) {
     const state = await observeState();
@@ -185,18 +284,9 @@ export async function superviseCast(
       inactiveObservations >= INACTIVE_OBSERVATIONS_BEFORE_RECOVERY ||
       bufferingObservations >= BUFFERING_OBSERVATIONS_BEFORE_RECOVERY
     ) {
-      if (recoveries >= config.recoverAttempts) {
-        throw new SupervisorError("Playback became inactive.");
-      }
-      recoveries += 1;
       bufferingObservations = 0;
       inactiveObservations = 0;
-      emit({
-        attempt: recoveries,
-        maximum: config.recoverAttempts,
-        type: "recovering",
-      });
-      if (!(await castFreshManifest())) {
+      if (!(await castWithRecovery(true))) {
         emit({ type: "interrupted" });
         return;
       }
@@ -231,4 +321,16 @@ async function defaultSleep(
       throw error;
     }
   }
+}
+
+function effectivePlaybackState(status: CattStatus): PlaybackState {
+  if (
+    status.state === "PLAYING" &&
+    (status.hasContent === false ||
+      (status.receiverApp !== undefined &&
+        status.receiverApp !== "Default Media Receiver"))
+  ) {
+    return "UNKNOWN";
+  }
+  return status.state;
 }

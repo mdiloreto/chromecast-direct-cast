@@ -27,27 +27,34 @@ Cast from a page containing or linking to an HLS (`.m3u8`) or DASH (`.mpd`) play
 
 ```bash
 chromecast-direct-cast cast 'https://example.com/player' \
-  --device 'Living Room' \
+  --device '<device-name-or-ip>' \
+  --fallback 'https://example.com/backup-player' \
+  --fallback 'https://example.com/second-backup-player' \
   --volume 60 \
   --monitor 300 \
   --poll 10 \
   --recover 2
 ```
 
-The cast command waits for `PLAYING`, monitors state changes, and performs bounded rediscovery and recasting if playback becomes inactive or remains stuck buffering. It never prints the discovered manifest URL or its query parameters.
+The cast command freshly discovers the primary page first, then tries each fallback page in order if discovery, casting, or startup playback fails. Repeat `--fallback` to add more than one. It accepts `PLAYING` only from real media in the default receiver, monitors state changes, and rediscovers before every recovery. Use `--monitor 0 --recover 0` to keep watching and retrying until interrupted. Page and manifest URLs, query parameters, and raw `catt` output are not written to status or event logs.
 
 Other commands:
 
 ```bash
-chromecast-direct-cast status --device 'Living Room'
-chromecast-direct-cast volume 70 --device 'Living Room'
-chromecast-direct-cast stop --device 'Living Room'
+chromecast-direct-cast ui --port 8787
+chromecast-direct-cast status --device '<device-name-or-ip>'
+chromecast-direct-cast volume 70 --device '<device-name-or-ip>'
+chromecast-direct-cast stop --device '<device-name-or-ip>'
 ```
+
+The web UI binds only to a loopback address and prints its local URL. It scans available Chromecast devices, supports either a discovered receiver or a manual device name/address, accepts a required primary page and optional fallback pages (one per line), and runs monitoring and recovery indefinitely. Only one monitor runs at a time; use **Stop** before starting another. Stop ends the monitor and stops receiver playback.
+
+UI defaults can be supplied with `--primary` and `--fallback`, the polling interval with `--poll`, and the loopback family with `--host 127.0.0.1` or `--host ::1`. Prefer entering sensitive page URLs in the browser instead of placing them in command arguments.
 
 Set a default receiver to omit `--device`:
 
 ```bash
-export CHROMECAST_DEVICE='Living Room'
+export CHROMECAST_DEVICE='<device-name-or-ip>'
 ```
 
 Run `chromecast-direct-cast <command> --help` for all options. Cast defaults are 300 seconds of monitoring, 10-second polling, and 2 recovery attempts.
